@@ -51,6 +51,7 @@ local BUFF = {
 }
 
 local last_action_timestamp = 0
+local last_dragons_breath_cast = 0 -- NEW: Local timestamp for Dragon's Breath
 
 local FB_MAX_CHARGES = core.spell_book.get_spell_charge_max(SPELL.FIRE_BLAST) or 2
 local PF_MAX_CHARGES = core.spell_book.get_spell_charge_max(SPELL.PHOENIX_FLAMES) or 3
@@ -366,8 +367,11 @@ local function main_logic()
 
     elseif has_heating_up then
         local distance_sq_to_target = player_position:squared_dist_to_ignore_z(primary_target:get_position())
-        if menu.use_dragons_breath:get_state() and dragons_breath_cd == 0 and distance_sq_to_target < (12*12) and spell_helper:is_spell_castable(SPELL.DRAGONS_BREATH, player, primary_target, true, false) then
+        -- FIXED: Added a local cooldown check to prevent spamming Dragon's Breath
+        local dragons_breath_local_cd = 1500 -- 1.5 seconds
+        if menu.use_dragons_breath:get_state() and dragons_breath_cd == 0 and (core.game_time() - last_dragons_breath_cast > dragons_breath_local_cd) and distance_sq_to_target < (12*12) and spell_helper:is_spell_castable(SPELL.DRAGONS_BREATH, player, primary_target, true, false) then
             queue_action(SPELL.DRAGONS_BREATH, primary_target, 6, "[Fire] Dragon's Breath (Proc Gen)")
+            last_dragons_breath_cast = core.game_time() -- Set the local timestamp
             return
         elseif fire_blast_charges > 0 and spell_helper:is_spell_castable(SPELL.FIRE_BLAST, player, primary_target) then
             queue_action(SPELL.FIRE_BLAST, primary_target, 5, "[Fire] Convert Heating Up with Fire Blast")
