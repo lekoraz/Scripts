@@ -1,3 +1,5 @@
+-- main.lua
+
 ---@type spell_queue
 local spell_queue = require("common/modules/spell_queue")
 ---@type spell_helper
@@ -53,6 +55,8 @@ local BUFF = {
 local last_action_timestamp = 0
 local last_dragons_breath_cast = 0
 local last_aoe_switch_time = 0
+local last_combustion_start_time = 0 
+local is_in_combustion_opener = false 
 
 local FB_MAX_CHARGES = core.spell_book.get_spell_charge_max(SPELL.FIRE_BLAST) or 2
 local PF_MAX_CHARGES = core.spell_book.get_spell_charge_max(SPELL.PHOENIX_FLAMES) or 3
@@ -134,36 +138,51 @@ local function on_render_control_panel()
     return control_panel_elements
 end
 
-local function queue_action(spell_id, target, priority, message, is_positional)
-    if not target then return end
-    local cast_target = is_positional and target or target
-    
+local function queue_action(spell_id, target_or_position, priority, message, is_positional)
     if is_positional then
-        spell_queue:queue_spell_position(spell_id, cast_target, priority, message)
+        if not target_or_position then return end 
+        spell_queue:queue_spell_position(spell_id, target_or_position, priority, message)
     else
-        spell_queue:queue_spell_target(spell_id, cast_target, priority, message)
+        if not target_or_position or not target_or_position.is_valid or not target_or_position:is_valid() then return end
+        spell_queue:queue_spell_target(spell_id, target_or_position, priority, message)
     end
     last_action_timestamp = core.game_time()
 end
 
-local function get_primary_rotation_target(player, nearby_enemies, consider_cleave)
+-- Helper to determine if a spell cast should be Pyroblast or Flamestrike based on AoE mode and target count
+local function get_spender_spell(use_aoe_rotation, current_enemy_count)
+    if use_aoe_rotation and current_enemy_count >= menu.aoe_min_targets:get() then
+        return SPELL.FLAMESTRIKE
+    end
+    return SPELL.PYROBLAST
+end
+
+-- Helper to get builders based on AoE preference
+local function get_builder_spells(use_aoe_rotation)
+    return {SPELL.FIRE_BLAST, SPELL.PHOENIX_FLAMES, SPELL.SCORCH}
+end
+
+
+local function get_primary_rotation_target(player, nearby_enemies, use_aoe_rotation)
     local player_target = player:get_target()
     if player_target and unit_helper:is_valid_enemy(player_target) then return player_target end
-    if consider_cleave and #nearby_enemies >= 2 then
+
+    if use_aoe_rotation and #nearby_enemies >= menu.aoe_min_targets:get() then
         local highest_ignite_target
-        local max_ignite_value = -1
+        local max_ignite_stacks = -1 
         for _, enemy in ipairs(nearby_enemies) do
             local ignite_buff = buff_manager:get_buff_data(enemy, BUFF.IGNITE)
             if ignite_buff.is_active then
-                local current_ignite_value = ignite_buff.value or 1
-                if current_ignite_value > max_ignite_value then
-                    max_ignite_value = current_ignite_value
+                local current_ignite_stacks = ignite_buff.stacks or 0 
+                if current_ignite_stacks > max_ignite_stacks then
+                    max_ignite_stacks = current_ignite_stacks
                     highest_ignite_target = enemy
                 end
             end
         end
         if highest_ignite_target then return highest_ignite_target end
     end
+
     local highest_health_target
     local max_health_percent = -1
     for _, enemy in ipairs(nearby_enemies) do
@@ -178,7 +197,7 @@ end
 
 local function should_cast_meteor(player, nearby_enemies, use_aoe_rotation, primary_target)
     if not menu.use_meteor:get_state() then return false, nil end
-    if not use_aoe_rotation then return false, nil end 
+    if not use_aoe_rotation then return false, nil end
     if #nearby_enemies < menu.meteor_min_targets:get() then return false, nil end 
 
     if core.spell_book.get_spell_cooldown(SPELL.METEOR) > 0 then return false, nil end
@@ -187,13 +206,13 @@ local function should_cast_meteor(player, nearby_enemies, use_aoe_rotation, prim
     local meteor_prediction_data = spell_prediction:new_spell_data(
         SPELL.METEOR, 40, 8, 1.5, 0.0,
         spell_prediction.prediction_type.MOST_HITS,
-        spell_prediction.geometry_type.CIRCLE,
+        spell_prediction.geometry.type.CIRCLE, -- Changed from spell_prediction.geometry_type.CIRCLE
         player_position
     )
-    local best_meteor_pos_info = spell_prediction:get_cast_position(player, meteor_prediction_data)
+    local best_meteor_pos_info = spell_prediction:get_cast_position(primary_target, meteor_prediction_data)
     
     if best_meteor_pos_info and best_meteor_pos_info.amount_of_hits >= menu.meteor_min_targets:get() then
-        if spell_helper:is_spell_castable(SPELL.METEOR, player, primary_target, false, true) then
+        if spell_helper:is_spell_castable(SPELL.METEOR, player, player) then 
             return true, best_meteor_pos_info.cast_position
         end
     end
@@ -208,7 +227,7 @@ end
 local function should_cast_blazing_barrier(player)
     if not menu.use_blazing_barrier:get_state() then return false end
     local current_health_pct = unit_helper:get_health_percentage(player)
-    local predicted_health_pct, _, _, _ = unit_helper:get_health_percentage_inc(player, 3.0) 
+    local predicted_health_pct, _, _, _ = unit_helper:get_health_percentage_inc(player, 3.0)
     if current_health_pct <= menu.blazing_barrier_min_health_pct:get() then
         return spell_helper:is_spell_castable(SPELL.BLAZING_BARRIER, player, player)
     end
@@ -228,35 +247,199 @@ local function should_cast_arcane_intellect(player, nearby_allies)
     return false
 end
 
+local function handle_double_cast(player, primary_target, use_aoe_rotation, has_heating_up, has_hot_streak, is_in_combustion, nearby_enemies)
+    local main_spender = get_spender_spell(use_aoe_rotation, #nearby_enemies) 
+    
+    if has_hot_streak then
+        queue_action(main_spender, primary_target, 7, "[Fire] Double Cast Spender - Hot Streak")
+        return true
+    elseif has_heating_up then
+        local fire_blast_charges = core.spell_book.get_spell_charge(SPELL.FIRE_BLAST)
+        local phoenix_flames_charges = core.spell_book.get_spell_charge(SPELL.PHOENIX_FLAMES)
+
+        if fire_blast_charges > 0 and spell_helper:is_spell_castable(SPELL.FIRE_BLAST, player, primary_target) then
+            queue_action(SPELL.FIRE_BLAST, primary_target, 6, "[Fire] Convert Heating Up with Fire Blast")
+            return true
+        elseif menu.use_phoenix_flames:get_state() and phoenix_flames_charges > 0 and spell_helper:is_spell_castable(SPELL.PHOENIX_FLAMES, player, primary_target) then
+            queue_action(SPELL.PHOENIX_FLAMES, primary_target, 6, "[Fire] Convert Heating Up with Phoenix Flames")
+            return true
+        end
+    end
+    return false
+end
+
+local function get_hot_streak_spender(use_aoe_rotation, nearby_enemies) 
+    local target_count = #nearby_enemies
+    return get_spender_spell(use_aoe_rotation, target_count)
+end
+
+local function get_hyperthermia_spender(use_aoe_rotation, nearby_enemies)
+    local target_count = #nearby_enemies
+    return get_spender_spell(use_aoe_rotation, target_count)
+end
+
+local function handle_combustion_rotation(player, primary_target, nearby_enemies, has_hot_streak, has_hyperthermia, use_aoe_rotation)
+    local current_time = core.game_time()
+    local main_spender = get_hot_streak_spender(use_aoe_rotation, nearby_enemies) 
+
+    if has_hot_streak then
+        queue_action(main_spender, primary_target, 7, "[Fire] Combustion Hot Streak Spender")
+        return true
+    end
+
+    if has_hyperthermia then
+        queue_action(main_spender, primary_target, 8, "[Fire] Combustion Hyperthermia Spender")
+        return true
+    end
+
+    local fire_blast_charges = core.spell_book.get_spell_charge(SPELL.FIRE_BLAST)
+    local phoenix_flames_charges = core.spell_book.get_spell_charge(SPELL.PHOENIX_FLAMES)
+
+    if fire_blast_charges > 0 and spell_helper:is_spell_castable(SPELL.FIRE_BLAST, player, primary_target) then
+        queue_action(SPELL.FIRE_BLAST, primary_target, 6, "[Fire] Combustion Fire Blast Builder")
+        return true
+    end
+
+    if menu.use_phoenix_flames:get_state() and phoenix_flames_charges > 0 and spell_helper:is_spell_castable(SPELL.PHOENIX_FLAMES, player, primary_target) then
+        queue_action(SPELL.PHOENIX_FLAMES, primary_target, 6, "[Fire] Combustion Phoenix Flames Builder")
+        return true
+    end
+
+    if spell_helper:is_spell_castable(SPELL.SCORCH, player, primary_target) then
+        queue_action(SPELL.SCORCH, primary_target, 6, "[Fire] Combustion Scorch Builder")
+        return true
+    end
+
+    if spell_helper:is_spell_castable(SPELL.FIREBALL, player, primary_target) then
+        queue_action(SPELL.FIREBALL, primary_target, 6, "[Fire] Combustion Fireball Filler")
+        return true
+    end
+
+    return false
+end
+
+local function handle_outside_combustion_rotation(player, primary_target, nearby_enemies, has_heating_up, has_hot_streak, has_hyperthermia, ftb_needs_refresh, is_moving, use_aoe_rotation) 
+    local fire_blast_charges = core.spell_book.get_spell_charge(SPELL.FIRE_BLAST)
+    local phoenix_flames_charges = core.spell_book.get_spell_charge(SPELL.PHOENIX_FLAMES)
+    local shifting_power_cd = core.spell_book.get_spell_cooldown(SPELL.SHIFTING_POWER)
+    local dragons_breath_cd = core.spell_book.get_spell_cooldown(SPELL.DRAGONS_BREATH)
+    local current_time = core.game_time()
+    local player_position = player:get_position()
+    local target_health_pct = unit_helper:get_health_percentage(primary_target)
+
+    local main_spender = get_hot_streak_spender(use_aoe_rotation, nearby_enemies) 
+    local hyperthermia_spender = get_hyperthermia_spender(use_aoe_rotation, nearby_enemies)
+
+    if has_heating_up and fire_blast_charges > 0 and spell_helper:is_spell_castable(SPELL.FIRE_BLAST, player, primary_target) then
+        queue_action(SPELL.FIRE_BLAST, primary_target, 5, "[Fire] Convert Heating Up with Fire Blast")
+        return true
+    end
+    if fire_blast_charges == FB_MAX_CHARGES and spell_helper:is_spell_castable(SPELL.FIRE_BLAST, player, primary_target) then
+        queue_action(SPELL.FIRE_BLAST, primary_target, 5, "[Fire] Fire Blast (Overcap)")
+        return true
+    end
+    if ftb_needs_refresh and fire_blast_charges > 0 and spell_helper:is_spell_castable(SPELL.FIRE_BLAST, player, primary_target) then
+         queue_action(SPELL.FIRE_BLAST, primary_target, 5, "[Fire] Fire Blast (FtB Refresh)")
+        return true
+    end
+
+    if has_hyperthermia then
+        queue_action(hyperthermia_spender, primary_target, 8, "[Fire] Hyperthermia Spender")
+        return true
+    end
+
+    if has_hot_streak then
+        queue_action(main_spender, primary_target, 7, "[Fire] Hot Streak Spender")
+        return true
+    end
+
+    if menu.use_shifting_power:get_toggle_state() and shifting_power_cd == 0 and not is_moving then
+        if fire_blast_charges == 0 and phoenix_flames_charges == 0 then
+            if spell_helper:is_spell_castable(SPELL.SHIFTING_POWER, player, player) then
+                queue_action(SPELL.SHIFTING_POWER, player, 2, "[Fire] Shifting Power")
+                return true
+            end
+        end
+    end
+
+    if menu.use_phoenix_flames:get_state() and phoenix_flames_charges > 0 then
+        if phoenix_flames_charges == PF_MAX_CHARGES and spell_helper:is_spell_castable(SPELL.PHOENIX_FLAMES, player, primary_target) then
+            queue_action(SPELL.PHOENIX_FLAMES, primary_target, 5, "[Fire] Phoenix Flames (Overcap)")
+            return true
+        elseif ftb_needs_refresh and spell_helper:is_spell_castable(SPELL.PHOENIX_FLAMES, player, primary_target) then
+            queue_action(SPELL.PHOENIX_FLAMES, primary_target, 5, "[Fire] Phoenix Flames (FtB Refresh)")
+            return true
+        elseif spell_helper:is_spell_castable(SPELL.PHOENIX_FLAMES, player, primary_target) then
+            queue_action(SPELL.PHOENIX_FLAMES, primary_target, 1, "[Fire] Filler Phoenix Flames")
+            return true
+        end
+    end
+
+    if (target_health_pct <= 0.30) or is_moving then
+        if spell_helper:is_spell_castable(SPELL.SCORCH, player, primary_target) then
+            queue_action(SPELL.SCORCH, primary_target, 1, "[Fire] Scorch (Execute/Movement)")
+            return true
+        end
+    end
+
+    if menu.use_meteor:get_state() then
+        local overall_combat_ttd = combat_forecast:get_forecast()
+        if overall_combat_ttd > 5.0 then 
+            local can_cast_meteor, meteor_pos = should_cast_meteor(player, nearby_enemies, use_aoe_rotation, primary_target)
+            if can_cast_meteor then
+                queue_action(SPELL.METEOR, meteor_pos, 2, "[Fire] Meteor AoE", true)
+                return true
+            end
+        end
+    end
+
+    local distance_sq_to_target = player_position:squared_dist_to_ignore_z(primary_target:get_position())
+    if menu.use_dragons_breath:get_state() and dragons_breath_cd == 0 and (current_time - last_dragons_breath_cast > 1500) and distance_sq_to_target < (12*12) and spell_helper:is_spell_castable(SPELL.DRAGONS_BREATH, player, primary_target, true, false) then
+        queue_action(SPELL.DRAGONS_BREATH, primary_target, 6, "[Fire] Dragon's Breath (Proc Gen)")
+        last_dragons_breath_cast = current_time
+        return true
+    end
+
+    if spell_helper:is_spell_castable(SPELL.FIREBALL, player, primary_target) then
+        queue_action(SPELL.FIREBALL, primary_target, 1, "[Fire] Filler Fireball")
+        return true
+    end
+
+    return false
+end
+
 local function main_logic()
     if not menu.enable_rotation:get_toggle_state() then return end
     
     local player = core.object_manager.get_local_player()
     if not player or player:is_dead() or not core.spell_book.is_player_in_control() then return end
-    if core.game_time() - last_action_timestamp < menu.action_delay:get() then return end
     
-    local latency = core.get_ping()
-    if player:is_casting_spell(latency) or player:is_channelling_spell(latency) then return end
+    local current_time = core.game_time()
+    if current_time - last_action_timestamp < menu.action_delay:get() then return end
+    
+    if player:is_casting_spell() or player:is_channelling_spell() then return end
 
     local player_position = player:get_position()
     local nearby_enemies = unit_helper:get_enemy_list_around(player_position, 40.0)
     
+    if should_cast_blazing_barrier(player) then
+        queue_action(SPELL.BLAZING_BARRIER, player, 8, "[Fire] Defensive Blazing Barrier")
+        return
+    end
+
     if #nearby_enemies == 0 or not unit_helper:is_in_combat(player) then
-        local nearby_allies = unit_helper:get_ally_list_around(player_position, 40.0, true, true) 
+        local nearby_allies = unit_helper:get_ally_list_around(player_position, 40.0, true, true)
         if should_cast_arcane_intellect(player, nearby_allies) then
             queue_action(SPELL.ARCANE_INTELLECT, player, 1, "[Fire] Arcane Intellect")
-        end
-        if should_cast_blazing_barrier(player) then
-            queue_action(SPELL.BLAZING_BARRIER, player, 3, "[Fire] Blazing Barrier")
         end
         return
     end
 
     local use_aoe_rotation = false
     local selected_mode = menu.aoe_mode:get()
-    if selected_mode == 1 then
+    if selected_mode == 1 then 
         if #nearby_enemies >= menu.aoe_min_targets:get() then use_aoe_rotation = true end
-    elseif selected_mode == 3 then
+    elseif selected_mode == 3 then 
         use_aoe_rotation = true
     end
 
@@ -270,96 +453,41 @@ local function main_logic()
     local has_hyperthermia = buff_manager:get_buff_data(player, BUFF.HYPERTHERMIA).is_active
     local ftb_needs_refresh = should_refresh_feel_the_burn(player)
     
-    local fire_blast_charges = core.spell_book.get_spell_charge(SPELL.FIRE_BLAST)
-    local phoenix_flames_charges = core.spell_book.get_spell_charge(SPELL.PHOENIX_FLAMES)
     local combustion_cd = core.spell_book.get_spell_cooldown(SPELL.COMBUSTION)
-    local dragons_breath_cd = core.spell_book.get_spell_cooldown(SPELL.DRAGONS_BREATH)
-    
-    if should_cast_blazing_barrier(player) then
-        queue_action(SPELL.BLAZING_BARRIER, player, 8, "[Fire] Defensive")
-        return
 
-    elseif is_in_combustion then
-        if has_hot_streak then
-            if use_aoe_rotation and spell_helper:is_spell_castable(SPELL.FLAMESTRIKE, player, primary_target, true, true) then
-                queue_action(SPELL.FLAMESTRIKE, primary_target:get_position(), 7, "[Fire] Combustion Flamestrike", true)
-            else
-                queue_action(SPELL.PYROBLAST, primary_target, 7, "[Fire] Combustion Pyroblast")
-            end
-        elseif phoenix_flames_charges > 0 and menu.use_phoenix_flames:get_state() then
-             queue_action(SPELL.PHOENIX_FLAMES, primary_target, 6, "[Fire] Combustion Phoenix")
-        elseif fire_blast_charges > 0 then
-             queue_action(SPELL.FIRE_BLAST, primary_target, 6, "[Fire] Combustion Fire Blast")
-        else
-            queue_action(SPELL.SCORCH, primary_target, 6, "[Fire] Combustion Scorch")
-        end
-        return
-        
-    elseif has_hyperthermia then
-         queue_action(SPELL.PYROBLAST, primary_target, 8, "[Fire] Hyperthermia Pyroblast")
-        return
-
-    elseif menu.use_combustion:get_toggle_state() and combustion_cd == 0 and fire_blast_charges > 0 then
+    if menu.use_combustion:get_toggle_state() and combustion_cd == 0 then
         local time_to_die = combat_forecast:get_forecast_single(primary_target)
-        if time_to_die > 8.0 then 
+        if time_to_die == 0 or time_to_die > 8.0 then 
             if spell_helper:is_spell_castable(SPELL.COMBUSTION, player, player) then
-                queue_action(SPELL.COMBUSTION, player, 9, "[Fire] Activating Combustion")
-                return
+                if spell_helper:is_spell_castable(SPELL.SCORCH, player, primary_target) and not is_moving then
+                    queue_action(SPELL.COMBUSTION, player, 9, "[Fire] Activating Combustion")
+                    is_in_combustion_opener = true
+                    last_combustion_start_time = current_time
+                    return
+                elseif spell_helper:is_spell_castable(SPELL.FIREBALL, player, primary_target) and not is_moving then
+                     queue_action(SPELL.COMBUSTION, player, 9, "[Fire] Activating Combustion")
+                     is_in_combustion_opener = true
+                     last_combustion_start_time = current_time
+                     return
+                end
+                if player:is_casting_spell() or player:is_channelling_spell() then
+                    queue_action(SPELL.COMBUSTION, player, 9, "[Fire] Activating Combustion (During Cast)")
+                    is_in_combustion_opener = true
+                    last_combustion_start_time = current_time
+                    return
+                end
             end
         end
-    
-    elseif has_hot_streak then
-        if use_aoe_rotation then
-             local prediction_result = spell_prediction:get_cast_position(primary_target, spell_prediction:new_spell_data(SPELL.FLAMESTRIKE, 40, 8, 0, 0, spell_prediction.prediction_type.MOST_HITS, spell_prediction.geometry_type.CIRCLE, player:get_position()))
-             if prediction_result and prediction_result.cast_position then
-                 queue_action(SPELL.FLAMESTRIKE, prediction_result.cast_position, 4, "[Fire] Hot Streak Flamestrike", true)
-             end
-        else
-            queue_action(SPELL.PYROBLAST, primary_target, 4, "[Fire] Hot Streak Pyroblast")
-        end
-        return
+    end
 
-    elseif (fire_blast_charges == FB_MAX_CHARGES or (ftb_needs_refresh and fire_blast_charges > 0)) and spell_helper:is_spell_castable(SPELL.FIRE_BLAST, player, primary_target) then
-        queue_action(SPELL.FIRE_BLAST, primary_target, 5, "[Fire] Fire Blast (Overcap/FtB)")
-        return
-    elseif menu.use_phoenix_flames:get_state() and (phoenix_flames_charges == PF_MAX_CHARGES or (ftb_needs_refresh and phoenix_flames_charges > 0)) and spell_helper:is_spell_castable(SPELL.PHOENIX_FLAMES, player, primary_target) then
-        queue_action(SPELL.PHOENIX_FLAMES, primary_target, 5, "[Fire] Phoenix Flames (Overcap/FtB)")
-        return
-
-    elseif has_heating_up then
-        local distance_sq_to_target = player_position:squared_dist_to_ignore_z(primary_target:get_position())
-        if menu.use_dragons_breath:get_state() and dragons_breath_cd == 0 and (core.game_time() - last_dragons_breath_cast > 1500) and distance_sq_to_target < (12*12) and spell_helper:is_spell_castable(SPELL.DRAGONS_BREATH, player, primary_target, true, false) then
-            queue_action(SPELL.DRAGONS_BREATH, primary_target, 6, "[Fire] Dragon's Breath (Proc Gen)")
-            last_dragons_breath_cast = core.game_time()
-            return
-        elseif fire_blast_charges > 0 and spell_helper:is_spell_castable(SPELL.FIRE_BLAST, player, primary_target) then
-            queue_action(SPELL.FIRE_BLAST, primary_target, 5, "[Fire] Convert Heating Up with Fire Blast")
-            return
-        elseif phoenix_flames_charges > 0 and menu.use_phoenix_flames:get_state() and spell_helper:is_spell_castable(SPELL.PHOENIX_FLAMES, player, primary_target) then
-            queue_action(SPELL.PHOENIX_FLAMES, primary_target, 5, "[Fire] Convert Heating Up with Phoenix Flames")
+    if is_in_combustion then
+        if handle_combustion_rotation(player, primary_target, nearby_enemies, has_hot_streak, has_hyperthermia, use_aoe_rotation) then
+            is_in_combustion_opener = false
             return
         end
-        
-    elseif menu.use_meteor:get_state() then
-        local overall_combat_ttd = combat_forecast:get_forecast()
-        if overall_combat_ttd > 5.0 then 
-            local can_cast_meteor, meteor_pos = should_cast_meteor(player, nearby_enemies, use_aoe_rotation, primary_target)
-            if can_cast_meteor then
-                queue_action(SPELL.METEOR, meteor_pos, 2, "[Fire] Meteor AoE", true) 
-                return
-            end
-        end
-    elseif menu.use_shifting_power:get_toggle_state() and fire_blast_charges == 0 and phoenix_flames_charges == 0 and not is_moving and spell_helper:is_spell_castable(SPELL.SHIFTING_POWER, player, player) then
-        queue_action(SPELL.SHIFTING_POWER, player, 2, "[Fire] Shifting Power")
-        return
-        
     else
-        if menu.use_phoenix_flames:get_state() and phoenix_flames_charges > 0 and spell_helper:is_spell_castable(SPELL.PHOENIX_FLAMES, player, primary_target) then
-            queue_action(SPELL.PHOENIX_FLAMES, primary_target, 1, "[Fire] Filler Phoenix Flames")
-        elseif is_moving or (unit_helper:get_health_percentage(primary_target) <= 0.30) then
-            queue_action(SPELL.SCORCH, primary_target, 1, "[Fire] Filler Scorch")
-        else
-            queue_action(SPELL.FIREBALL, primary_target, 1, "[Fire] Filler Fireball")
+        if handle_outside_combustion_rotation(player, primary_target, nearby_enemies, has_heating_up, has_hot_streak, has_hyperthermia, ftb_needs_refresh, is_moving, use_aoe_rotation) then
+            return
         end
     end
 end
